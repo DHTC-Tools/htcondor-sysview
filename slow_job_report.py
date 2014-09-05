@@ -1,38 +1,62 @@
 #!/usr/bin/env python
-#
-# $Id: Exp $
-#
-#  Write out html user reports
 
-
-from vars import *
-from sv_util import *
-from mc_util import *
-import sys, os, re, time, string
+import sys, os, time, string
 import memcache
 
-
+verbose = False
 mc = None
-verbose = 0
-debug = 0
-print_times = False
+suppressEmptyEmails = True
+MIN_WALLTIME=3 #hours
+MAX_EFF=5 #percent 
+PANDA_URL='http://bigpanda.cern.ch/job?pandaid='
+CONDOR_URL='http://www.mwt2.org/sys/view/job_info/'
 
-for x in sys.argv:
-    if x.startswith('-v'):
-        verbose = x.count('v')
-        print "verbose output enabled"
-    if x.startswith('-d'):
-        debug = x.count('d')
-        print "debug output enabled"
-    if x.startswith('-t'):
-        print_times = True
-        print "timing enabled"
+def mc_init():
+    global mc
+    if not mc:
+        mc = memcache.Client(['mc.mwt2.org:11211'])
 
-print "CLUSTER_ID is %s " % CLUSTER_ID
+def mc_get(key):
+    mc_init()
+    try:
+        r = mc.get(key)
+    except:
+	r = None
+    if verbose:
+	print "GET", key, r
+    return r
 
+def HMS(x):
+    x = int(x)
+    s, x = x%60, int(x/60)
+    m, x = x%60, int(x/60)
+    return "%02d:%02d:%02d" % (x,m,s)
+
+def strip_chars(x):
+    valid_chars = "-_.%s%s" % (string.ascii_letters, string.digits)
+    if x is None:
+        x = "None"
+    return ''.join(c for c in x if c in valid_chars)
+
+def write_email_header(jobs, ofile=sys.stdout):
+    emptyFlag = '/var/local/sysview/sys/sjr/EmptyJobsList'
+    #create a flag if there are no jobs
+    if (suppressEmptyEmails and not jobs):
+        f = open(emptyFlag, 'w')
+        f.close()
+    else:
+        #if empty flag exists remove it
+        if (os.access(emptyFlag, os.W_OK)):
+            os.remove(emptyFlag)
+        ofile.write("""To: support@mwt2.org
+Subject: Low Efficiency Jobs
+Mime-Version: 1.0
+Content-Type: text/html
+
+""")
 
 def write_header(ofile=sys.stdout):
-    ofile.write("""<html><head><title>User/Job summary for %s</title></head>
+    ofile.write("""<html><head><title>Low Efficiency User/Job summary for MWT2</title></head>
 <script src='sorttable.js'></script>
 <style type="text/css">
 th, td {
@@ -48,9 +72,8 @@ table.sortable thead {
 </style>
 
 <body>
-<h3>User/Job summary for %s</h3>
-<h3>Generated on %s</h3>
-The table is sortable.""" % ( CLUSTER_ID, CLUSTER_ID, time.ctime() ) )
+<h3>Low Efficiency User/Job summary for MWT2</h3>
+<h3>Generated on %s</h3>""" % time.ctime())
 
 def mask_eq(k1, k2, mask):
     return  ((mask&1 or k1[0]==k2[0])
@@ -71,7 +94,7 @@ def merge_keys(keys, mask=0):
     return groups
 
 def write_job_table(jobs, group, ofile=sys.stdout, merge_mask=0):
-    fields = ["User", "Type", "Site", "HTCondor ID", "Walltime", "CPU time", "%Efficiency"]
+    fields = ["User", "Type", "Site", "Panda ID", "Condor ID", "Walltime", "CPU time", "%Efficiency"]
     merge_user = merge_mask & 1
     merge_type = merge_mask & 2
     merge_site = merge_mask & 4
@@ -86,12 +109,9 @@ def write_job_table(jobs, group, ofile=sys.stdout, merge_mask=0):
     ofile.write("<tbody>")
     rows=[]
     for keys in group:
-	  user, jobtype, site = keys
-	  for job in jobs[keys]:
-	     jobid = job[0]
-             jobid = str(jobid)
-             if (jobid != 'None'):
-
+	    user, jobtype, site = keys
+	    for job in jobs[keys]:
+	       jobid = job[0]
 	       try:
 			walltime = job[2][0] 
 	       except TypeError, e:
@@ -105,15 +125,21 @@ def write_job_table(jobs, group, ofile=sys.stdout, merge_mask=0):
 		    effcy  = 100.0 * cputime / walltime
 	       else:
 		    effcy = 0
+               try:
+		    panda_id=panda_condor_map[jobid]
+               except KeyError, e:
+                    panda_id=None
 	       rows.append((-walltime, """<tr><td>%s</td>
 <td>%s</td>
 <td align='center'>%s</td>
+<td align='right'><a href='%s%s'>%s</a></td>
 <td align='right'><a href='%s%s.html'>%s</a></td>
 <td sorttable_customkey='%s' align='right'>%s</td>
 <td sorttable_customkey='%s' align='right'>%s</td>
 <td align='right'>%.2f</td>
-</tr>\n""" % (user, jobtype, site, CONDOR_URL, jobid, jobid, walltime, HMS(walltime), cputime, HMS(cputime), effcy)))
-    rows.sort()
+</tr>\n""" % (user, jobtype, site, PANDA_URL, jobid, jobid,  CONDOR_URL, panda_id, panda_id, walltime, HMS(walltime), cputime, HMS(cputime), effcy)))
+
+    #rows.sort()
     for row in rows:
         ofile.write(row[1])
     ofile.write("</table>")
@@ -147,7 +173,6 @@ def write_table(jobs, ofile=sys.stdout, merge_mask=0):
         data = []
         for key in group:
             user, jobtype, site = key
-            if debug: print "USER %s, JOBTYPE %s, SITE %s" % (user, jobtype, site)
             #if user is None:
             #    continue
             data += jobs[key]
@@ -159,10 +184,8 @@ def write_table(jobs, ofile=sys.stdout, merge_mask=0):
             site = ""
         njobs = len(data)
         #job_index_filename= '_'.join([ strip_chars(k) for k in key]) + ".html"
-
-        # TODO find out why these files are not named correctly.
         job_index_filename=strip_chars("%s_%s_%s.html" % ( user, jobtype,site))
-	ji_file = open("jobinfo/" + job_index_filename, 'w') 
+	ji_file = open("/var/local/sysview/sys/sjr/." + job_index_filename, 'w') 
         write_header(ji_file)
 	#write_job_table(data, key, ji_file, merge_mask)
         write_job_table(jobs, group, ji_file, merge_mask)
@@ -188,53 +211,77 @@ def write_table(jobs, ofile=sys.stdout, merge_mask=0):
         ofile.write(row[1])
     ofile.write("</table>")
 
-    #for the eff
-    ename = '%s/effcy.txt' % (WEBDIR)
-    efile = open(ename, 'w') 
-    efile.write("%s" % effcy)
-    efile.close()
-
 def write_footer(ofile=sys.stdout):
     ofile.write("</body></html>\n")
 
-condor_ids = mc_get(CLUSTER_ID+".running_jobs")
-if not condor_ids:
-	sys.exit(1)
-
+panda_condor_map = mc_get('MWT2.panda_condor_map')
+if not panda_condor_map:
+    sys.exit(1)
+condor_ids = panda_condor_map.values()
 condor_ids.sort()
 
-
 jobs = {}  # key is (user, type, site)
-
 for condor_id in condor_ids:
     host = mc_get('%s.host' % condor_id)
     # Defaults
     user = 'Unknown'
     times = (0, 0)
-
     if host:
-        if ( host.find('.') >= 0 ):
-          site = host.split('.')[1]
-        if site.lower().startswith("%s" % CLUSTER_ID):
-          site = CLUSTER_ID.lower()
-    else:
-        site = '??'
-
-    user = mc_get('%s.user' % condor_id)
-    jobtype = None
-    times = mc_get('%s.times' % condor_id)
-
-    if verbose: print condor_id, user, site, jobtype, times
-    key = (user, jobtype, site)
-    if not jobs.has_key(key):
-        jobs[key] = []
-    jobs[key].append((condor_id, host, times))
-
+        #site = host[:2] # host.split('-')[0]
+        site = host.split('.')[1]
+        if site == 'mwt2':
+            if 'uc3' in host.split('.')[0]:
+                site = 'uc3'
+            else:
+                site = 'uc'
+        elif site == 'iu':
+            site = 'iu'
+        elif site == 'campuscluster':
+            site = 'uiuc'
+        elif site == 'dmz':
+            site = 'IllinoisLX'
+        else:
+            site = '??'
+        panda_id = mc_get('%s.panda_id' % condor_id)
+        info = mc_get('%s.info' % panda_id)
+        if info:
+            user = info[0]
+            jobtype = info[1]
+        else:
+            user = jobtype = None
+        times = mc_get('%s.times' % condor_id)
+        if not times:
+            times=(0.0, 0.0)
+        #if user is None:
+        #    user = 'unknown'
+        #if times is None or times[0] is None or times[1] is None:
+        #    continue
+        
+        if times[0] >= 3600*MIN_WALLTIME and times[1] / times[0] <= MAX_EFF/100.0:
+            #print user, jobtype, site, condor_id, panda_id, times
+            key = (user, jobtype, site)
+            if not jobs.has_key(key):
+                jobs[key] = []
+            jobs[key].append((panda_id, host, times))
+#if not jobs:
+#    print "No Low Efficiency Jobs."
+    
 for merge_mask in xrange(8):
     fname = 'userjobs%d.html' % merge_mask
-    ofile = open("jobinfo/" + fname, 'w') # open as hidden file
+    ofile = open("/var/local/sysview/sys/sjr/." + fname, 'w') # open as hidden file
     write_header(ofile)
     write_table(jobs, ofile, merge_mask)
     write_footer(ofile)
     ofile.close()
-    os.rename("jobinfo/"+fname, "jobinfo/"+fname)
+    os.rename("/var/local/sysview/sys/sjr/."+fname, "/var/local/sysview/sys/sjr/"+fname)
+
+fname = 'userjobs_report.html'
+ofile = open("/var/local/sysview/sys/sjr/."+fname, 'w')
+write_email_header(jobs, ofile)
+write_header(ofile)
+keys=jobs.keys()
+sorted(keys, key=lambda name: name[0])
+write_job_table(jobs, keys, ofile, 0)
+write_footer(ofile)
+ofile.close()
+os.rename("/var/local/sysview/sys/sjr/."+fname, "/var/local/sysview/sys/sjr/"+fname)
